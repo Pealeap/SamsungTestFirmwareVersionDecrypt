@@ -454,6 +454,6 @@ echo "$firmreplace" > firmware.json
 echo "$minfirmreplace" > firmware_mini.json
 echo "$md5firm" > md5_encoded_firmware_versions.json
 
-python samsung_test_firmware_decrypt.py --model $1 --csc $2
+python samsung_test_firmware_decrypt.py --model $1 --csc $2 "${@:3}"
 
 deactivate

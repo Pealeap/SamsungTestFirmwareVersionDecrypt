@@ -1,20 +1,16 @@
-from genericpath import exists
 import concurrent.futures
 import time
 import requests
 from requests.exceptions import ProxyError, RequestException
 import hashlib
+import hmac
 from lxml import etree
 import os
-import random
 from datetime import datetime
 from datetime import timezone
 from datetime import timedelta
 import json
-import pymysql
 from copy import deepcopy
-from func_timeout import func_set_timeout
-import func_timeout
 from dotenv import load_dotenv
 import string
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -24,6 +20,10 @@ from collections import OrderedDict
 import traceback
 import argparse
 import sys
+import multiprocessing
+
+if __name__ == "__main__":
+    multiprocessing.set_start_method("fork", force=True)
 
 FORCE_AP = None
 FORCE_CSC = None
@@ -35,12 +35,18 @@ FORCE_EUP = None
 FORCE_SY = None
 FORCE_EY = None
 parameters = "not none"
+num_workers = os.cpu_count()
+BRUTEFORCE = False
+FORCE_AP_START = None
+FORCE_AP_END = None
+FORCE_MODEM_START = None
+FORCE_MODEM_END = None
+FORCE_MODEL = None
 
 load_dotenv()
 thread_local = threading.local()
-isFirst = True
 oldMD5Dict = {}
-console = Console()
+console = Console(log_path=False)
 current_latest_version = "16"  # Current latest Android version number
 
 def printStr(msg):
@@ -74,6 +80,7 @@ def getCountryName(cc):
         "TPA": "Panama",
         "ZTO": "Brazil",
         "GTO": "Guatemala",
+        "XXV": "Vietnam",
     }
     if cc in cc2Country.keys():
         return cc2Country[cc]
@@ -91,17 +98,12 @@ def requestXML(url, max_retries=3, sleep_sec=1):
     """
     Request XML content
     """
-    UA_list = [
-        "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.0.0",
-        "Mozilla/5.0 (Linux; Android 9; SAMSUNG SM-T825Y) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/15.0 Chrome/90.0.4430.210 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3282.186 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.62 Safari/537.36",
-        "Mozilla/5.0 (Linux; U; Android 8.1.0; zh-cn; vivo X20A Build/OPM1.171019.011) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/77.0.3865.120 MQQBrowser/12.0 Mobile Safari/537.36 COVC/045730",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 11_0_3 like Mac OS X) AppleWebKit/604.3.5 (KHTML, like Gecko) Version/11.0 MQQBrowser/11.8.3 Mobile/15B87 Safari/604.1 QBWebViewUA/2 QBWebViewType/1 WKType/1",
-        "Mozilla/5.0 (Macintosh; U; PPC Mac OS X 10.5; en-US; rv:1.9.2.15) Gecko/20110303 Firefox/3.6.15",
-    ]
-    headers = {"User-Agent": random.choice(UA_list), "Connection": "close"}
+    headers = {
+        "User-Agent": "SAMSUNG-Android",
+        "Accept-Encoding": "identity",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
     for attempt in range(1, max_retries + 1):
         try:
             session = get_session()
@@ -141,12 +143,36 @@ def readXML(model, modelDic):
     """
     md5Dic = {}
     cc_list = modelDic[model]["CC"]
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
         results = pool.map(readXML_worker, [(model, cc) for cc in cc_list])
         for cc, md5list in results:
             if md5list:
                 md5Dic[cc] = md5list
     return md5Dic
+
+
+def _str_range(start: str, end: str) -> list:
+    """Generate all strings from start to end (inclusive) over the alphabet 0-9A-Z."""
+    letters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    n = len(start)
+    result = []
+    def _increment(s):
+        chars = list(s)
+        for i in range(len(chars) - 1, -1, -1):
+            idx = letters.index(chars[i])
+            if idx < len(letters) - 1:
+                chars[i] = letters[idx + 1]
+                for j in range(i + 1, len(chars)):
+                    chars[j] = letters[0]
+                return "".join(chars)
+        return None
+    current = start
+    while current is not None and current <= end:
+        result.append(current)
+        if current == end:
+            break
+        current = _increment(current)
+    return result
 
 
 def char_to_number(char):
@@ -174,23 +200,6 @@ def get_letters_range(start: str, end: str) -> str:
         raise Exception("String start and end error, please check")
     else:
         return letters[start_index:end_index].upper()
-
-
-def getFirmwareAddAndRemoveInfo(oldJson: list, newJson: list) -> dict:
-    """
-    Get firmware version add/remove information
-    Args:
-        oldJson(dict): Dictionary containing old version MD5s
-        newJson(dict): Dictionary containing new version MD5s
-    Returns:
-        dict: Get added firmware versions via key "added"; get removed firmware versions via key "removed"
-    """
-    oldSet = set(oldJson)
-    newSet = set(newJson)
-    info = {}
-    info["added"] = newSet - oldSet
-    info["removed"] = oldSet - newSet
-    return info
 
 
 def LoadOldMD5Firmware() -> dict:
@@ -244,16 +253,6 @@ def UpdateOldFirmware(newDict: dict):
         f.write(json.dumps(old_data, indent=4, ensure_ascii=False))
 
 
-def WriteInfo(model: str, cc: str, AddAndRemoveInfo: dict, modelDic: dict):
-    """
-    Record server firmware change information
-    Args:
-        model(str): Device model information
-        cc(str): Device region code
-        AddAndRemoveInfo(str): Contains add/remove firmware version information
-    """
-    global isFirst
-
 def getNowTime() -> str:
     SHA_TZ = timezone(
         timedelta(hours=8),
@@ -290,14 +289,174 @@ def get_pre_char(char, alphabet="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
     return alphabet[(index - 1) % len(alphabet)]
 
 
-# @func_set_timeout(2000)
+VERSION_TEST_HMAC_SHA256_KEY = "fcjimts25@%"
+MD5_HEX_LENGTH = 32
+HMAC_SHA256_HEX_LENGTH = 64
+
+
+def getVersionHashHmacSHA256(text: str) -> str:
+    """
+    Compute the HMAC-SHA256 (hex) of a candidate version string using Samsung's
+    version.test.xml key. Some devices (e.g. SM-F766U, SM-F966U, SM-A185F) use
+    HMAC-SHA256 instead of (or along with) MD5 in version.test.xml.
+    """
+    return hmac.new(
+        VERSION_TEST_HMAC_SHA256_KEY.encode("ascii"),
+        text.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def matchVersionTestHash(text: str, md5set: set, hmacset: set):
+    """
+    Check a candidate version string against the MD5 (32 hex) and/or
+    HMAC-SHA256 (64 hex) targets read from version.test.xml.
+    Returns the matched server hash (to use as dict key) or None.
+    """
+    if md5set:
+        md5hex = hashlib.md5(text.encode("utf-8")).hexdigest()
+        if md5hex in md5set:
+            return md5hex
+    if hmacset:
+        hmac256hex = getVersionHashHmacSHA256(text)
+        if hmac256hex in hmacset:
+            return hmac256hex
+    return None
+
+
+def versionTestHashName(hash_value: str) -> str:
+    """
+    Return the algorithm name (MD5 or HMAC-SHA256) of a matched server hash.
+    """
+    return "HMAC-SHA256" if len(hash_value) == HMAC_SHA256_HEX_LENGTH else "MD5"
+
+
+def _brute_phase1_worker(args):
+    chunk, ThirdCode, FirstCode, SecondCode, model, cc, md5set, hmacset, CpVersions_init, oldJson = args
+    matches = {}
+    new_cp = []
+    for i1, bl_version, update_version, yearStr, monthStr in chunk:
+        for serialStr in "".join(string.digits[1:] + string.ascii_uppercase):
+            randomVersion = bl_version + update_version + yearStr + monthStr + serialStr
+            tempCode = "" if not ThirdCode else ThirdCode + i1 + randomVersion
+            version1 = FirstCode + i1 + randomVersion + "/" + SecondCode + randomVersion + "/" + tempCode
+            matchedHash = matchVersionTestHash(version1, md5set, hmacset)
+            if matchedHash:
+                matches[matchedHash] = version1
+                cp = version1.split("/")[2]
+                if cp and cp not in CpVersions_init and cp not in new_cp:
+                    new_cp.append(cp)
+            vc2 = bl_version + "Z" + yearStr + monthStr + serialStr
+            version3 = FirstCode + i1 + vc2 + "/" + SecondCode + vc2 + "/" + tempCode
+            if not (model in oldJson and cc in oldJson.get(model, {}) and "versions" in oldJson.get(model, {}).get(cc, {}) and version3 in oldJson[model][cc]["versions"].values()):
+                matchedHash = matchVersionTestHash(version3, md5set, hmacset)
+                if matchedHash:
+                    matches[matchedHash] = version3
+                    cp = version3.split("/")[2]
+                    if cp and cp not in CpVersions_init and cp not in new_cp:
+                        new_cp.append(cp)
+    return matches, new_cp
+
+
+def _brute_phase2_worker(args):
+    chunk, ThirdCode, FirstCode, SecondCode, model, cc, md5set, hmacset, CpVersions_full, oldJson = args
+    matches = {}
+    for i1, bl_version, update_version, yearStr, monthStr in chunk:
+        tempCP = CpVersions_full[-12:].copy()
+        if ThirdCode:
+            for i in range(1, 3):
+                initCP = ThirdCode + i1 + bl_version + update_version + yearStr + monthStr + str(i)
+                if initCP not in tempCP:
+                    tempCP.append(initCP)
+        for serialStr in "".join(string.digits[1:] + string.ascii_uppercase):
+            initCP1 = ThirdCode + i1 + bl_version + update_version + yearStr + monthStr + get_pre_char(serialStr)
+            initCP2 = ThirdCode + i1 + bl_version + update_version + yearStr + monthStr + get_pre_char(get_pre_char(serialStr))
+            if initCP1 not in tempCP:
+                tempCP.append(initCP1)
+            if initCP2 not in tempCP:
+                tempCP.append(initCP2)
+            randomVersion = bl_version + update_version + yearStr + monthStr + serialStr
+            tempCode = "" if not ThirdCode else ThirdCode + i1 + randomVersion
+            version1 = FirstCode + i1 + randomVersion + "/" + SecondCode + randomVersion + "/" + tempCode
+            for tempCpVersion in tempCP:
+                version2 = FirstCode + i1 + randomVersion + "/" + SecondCode + randomVersion + "/" + tempCpVersion
+                if version1 == version2:
+                    continue
+                if (model in oldJson and cc in oldJson.get(model, {}) and "versions" in oldJson.get(model, {}).get(cc, {}) and version2 in oldJson[model][cc]["versions"].values()):
+                    continue
+                matchedHash = matchVersionTestHash(version2, md5set, hmacset)
+                if matchedHash:
+                    matches[matchedHash] = version2
+            vc2 = bl_version + "Z" + yearStr + monthStr + serialStr
+            version3 = FirstCode + i1 + vc2 + "/" + SecondCode + vc2 + "/" + tempCode
+            for tempCpVersion in tempCP:
+                version4 = FirstCode + i1 + vc2 + "/" + SecondCode + vc2 + "/" + tempCpVersion
+                if version1 == version4:
+                    continue
+                if (model in oldJson and cc in oldJson.get(model, {}) and "versions" in oldJson.get(model, {}).get(cc, {}) and version4 in oldJson[model][cc]["versions"].values()):
+                    continue
+                matchedHash = matchVersionTestHash(version4, md5set, hmacset)
+                if matchedHash:
+                    matches[matchedHash] = version4
+    return matches
+
+
+def _run_brute(FirstCode, ThirdCode, SecondCode, model, cc, md5set, hmacset, combos, CpVersions, oldJson, md5list, label=""):
+    DecDicts = {}
+    prefix = f" [{label}]" if label else ""
+    if len(md5list) > 0 and combos:
+        _i1, _bl, _up, _yr, _mo = combos[0]
+        _rv = _bl + _up + _yr + _mo + "1"
+        _tc = "" if not ThirdCode else ThirdCode + _i1 + _rv
+        _v1 = FirstCode + _i1 + _rv + "/" + SecondCode + _rv + "/" + _tc
+        printStr(f"From prefixes generation example{prefix}: {_v1}")
+
+    if combos:
+        chunk_size = max(1, (len(combos) + num_workers - 1) // num_workers)
+        chunks = [combos[i:i+chunk_size] for i in range(0, len(combos), chunk_size)]
+
+        shared_args = (ThirdCode, FirstCode, SecondCode, model, cc, md5set, hmacset, list(CpVersions), oldJson)
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            futures = [pool.submit(_brute_phase1_worker, (chunk, *shared_args)) for chunk in chunks]
+            for f in as_completed(futures):
+                matches, new_cp = f.result()
+                for matchedHash, verStr in matches.items():
+                    printStr(f"Added <{model} {getCountryName(cc)}>{prefix} test firmware {versionTestHashName(matchedHash)}: {verStr}")
+                DecDicts.update(matches)
+                for cp in new_cp:
+                    if cp not in CpVersions:
+                        CpVersions.append(cp)
+
+        shared_args2 = (ThirdCode, FirstCode, SecondCode, model, cc, md5set, hmacset, list(CpVersions), oldJson)
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            futures = [pool.submit(_brute_phase2_worker, (chunk, *shared_args2)) for chunk in chunks]
+            for f in as_completed(futures):
+                matches = f.result()
+                for matchedHash, verStr in matches.items():
+                    printStr(f"<Baseband> Added <{model} {getCountryName(cc)}>{prefix} test firmware {versionTestHashName(matchedHash)}: {verStr}")
+                DecDicts.update(matches)
+
+    return DecDicts
+
+
 def DecryptionFirmware(
     model: str, md5Dic: dict, cc: str, modelDic: dict, oldJson
 ) -> dict:
+    global parameters
     printStr(
         f"Starting decryption of <{model} {getCountryName(cc)} version> test firmware",
     )
     md5list = md5Dic[cc]
+    md5set = {v for v in md5list if len(v) == MD5_HEX_LENGTH}
+    hmacset = {v for v in md5list if len(v) == HMAC_SHA256_HEX_LENGTH}
+    if md5set and hmacset:
+        printStr(
+            f"<{model} {getCountryName(cc)}> version.test.xml has both MD5 ({len(md5set)}) and HMAC-SHA256 ({len(hmacset)}) hashes"
+        )
+    elif hmacset:
+        printStr(
+            f"<{model} {getCountryName(cc)}> version.test.xml uses HMAC-SHA256 only ({len(hmacset)} hashes)"
+        )
     url = f"https://fota-cloud-dn.ospserver.net/firmware/{cc}/{model}/version.xml"
     content = requestXML(url)
     if content == None:
@@ -317,29 +476,39 @@ def DecryptionFirmware(
     try:
         xml = etree.fromstring(content)
         if len(xml.xpath("//latest//text()")) == 0:
-            # Initialize version number for new device (sem version.xml)
+            # No official (latest) version published yet for this region/model
+            # (version.xml exists but has an empty <latest/> tag).
+            latestVer = ""
+            latestVerStr = "No official version yet"
+            currentOS = "Unknown"
+
+            def code_with(forced, table_val):
+                if forced is not None:
+                    return model.replace("SM-", "") + forced
+                if table_val is not None:
+                    return model.replace("SM-", "") + table_val
+                return ""
+
             if cc in ccList.keys():
-                latestVer = ""
-                latestVerStr = "No official version yet"
-                currentOS = "Unknown"
-                FirstCode = model.replace("SM-", "") + ccList[cc][0]
-                SecondCode = model.replace("SM-", "") + ccList[cc][1]
-                ThirdCode = model.replace("SM-", "") + ccList[cc][2]
+                prefix = ccList[cc]
+            else:
+                prefix = (None, None, None)
+                if not (FORCE_AP or FORCE_CSC or FORCE_MODEM):
+                    printStr(
+                        f"Warning: CSC <{cc}> has no official version and no forced "
+                        "prefixes (--ap/--cscp/--modem) were given. "
+                        "Nothing can be matched for this region."
+                    )
+            FirstCode = code_with(FORCE_AP, prefix[0])
+            SecondCode = code_with(FORCE_CSC, prefix[1])
+            ThirdCode = code_with(FORCE_MODEM, prefix[2])
+
+            if cc in ccList.keys():
                 startYear = chr(datetime.now().year - 2001 - 5 + ord("A"))
                 endYear = "Z"
             else:
-                printStr(f"Warning: CSC <{cc}> not found. Trying without them).")
-                latestVer = ""
-                latestVerStr = "No official version yet"
-
-                if FORCE_AP is not None:
-                    FirstCode = model.replace("SM-", "") + FORCE_AP
-                if FORCE_CSC is not None:
-                    SecondCode = model.replace("SM-", "") + FORCE_CSC
-                if FORCE_MODEM is not None:
-                    ThirdCode = model.replace("SM-", "") + FORCE_MODEM
-                    parameters = None
-                currentOS = "Unknown"
+                startYear = chr(datetime.now().year - 2001 - 1 + ord("A"))
+                endYear = get_next_char(startYear) or startYear
         else:
             # Directly get current latest version number information from server
             latestVerStr = xml.xpath("//latest//text()")[0]
@@ -420,7 +589,12 @@ def DecryptionFirmware(
                 return default
             return c
 
-        if FORCE_AP is not None and FORCE_MODEM is not None and FORCE_STARTBL is not None and FORCE_ENDBL is not None and FORCE_SUP is not None and FORCE_EUP is not None and FORCE_SY is not None and FORCE_EY is not None and args.output is not None:
+        all_forced = (
+            FORCE_STARTBL is not None and FORCE_ENDBL is not None
+            and FORCE_SUP is not None and FORCE_EUP is not None
+            and FORCE_SY is not None and FORCE_EY is not None
+        )
+        if all_forced:
             startBLVersion = FORCE_STARTBL
             endBLVersion = FORCE_ENDBL
             startUpdateCount = FORCE_SUP
@@ -452,103 +626,65 @@ def DecryptionFirmware(
         updateLst += "Z"
 
         starttime = time.perf_counter()
-        first_run = True
+
+        combos = []
         for i1 in "US":
             for bl_version in get_letters_range(startBLVersion, endBLVersion):
                 for update_version in updateLst:
                     for yearStr in get_letters_range(startYear, endYear):
                         for monthStr in get_letters_range("A", "L"):
-                            tempCP = CpVersions[-12:].copy()
-                            if ThirdCode:
-                                for i in range(1, 3):
-                                    initCP = ThirdCode + i1 + bl_version + update_version + yearStr + monthStr + str(i)
-                                    tempCP.append(initCP)
-                            for serialStr in "".join(string.digits[1:] + string.ascii_uppercase):
-                                initCP1 = ThirdCode + i1 + bl_version + update_version + yearStr + monthStr + get_pre_char(serialStr)
-                                initCP2 = ThirdCode + i1 + bl_version + update_version + yearStr + monthStr + get_pre_char(get_pre_char(serialStr))
-                                if initCP1 not in tempCP:
-                                    tempCP.append(initCP1)
-                                if initCP2 not in tempCP:
-                                    tempCP.append(initCP2)
-                                randomVersion = bl_version + update_version + yearStr + monthStr + serialStr
-                                tempCode = "" if not ThirdCode else ThirdCode + i1 + randomVersion
-                                version1 = FirstCode + i1 + randomVersion + "/" + SecondCode + randomVersion + "/" + tempCode
+                            combos.append((i1, bl_version, update_version, yearStr, monthStr))
 
-                                if first_run and len(md5list) > 0:
-                                    printStr(f"From prefixes generation example: {version1}")
-                                    printStr(f"First MD5 found: {md5list[0]}")
-                                    test_md5 = hashlib.md5(version1.encode()).hexdigest()
-                                    printStr(f"Calculated MD5 example: {test_md5}")
-                                    first_run = False
+        CpVersions_initial = list(CpVersions)
+        result = _run_brute(FirstCode, ThirdCode, SecondCode, model, cc, md5set, hmacset, combos, CpVersions, oldJson, md5list)
+        DecDicts.update(result)
 
-                                md5 = hashlib.md5()
-                                md5.update(version1.encode())
-                                if md5.hexdigest() in md5list:
-                                    DecDicts[md5.hexdigest()] = version1
-                                    printStr(f"Added <{model} {getCountryName(cc)}> test firmware: {version1}")
-                                    if version1.split("/")[2] and version1.split("/")[2] not in CpVersions and version1.split("/")[2] not in tempCP:
-                                        CpVersions.append(version1.split("/")[2])
-                                        tempCP.append(version1.split("/")[2])
+        if FORCE_MODEL:
+            matched = set(DecDicts.keys())
+            remain_md5 = md5set - matched
+            remain_hmac = hmacset - matched
+            if remain_md5 or remain_hmac:
+                remain_list = list(remain_md5 | remain_hmac)
+                xml_model_prefix = model.replace("SM-", "")
+                fm_prefix = FORCE_MODEL.replace("SM-", "")
+                fm_FirstCode = fm_prefix + FirstCode[len(xml_model_prefix):]
+                fm_SecondCode = fm_prefix + SecondCode[len(xml_model_prefix):]
+                fm_ThirdCode = fm_prefix + ThirdCode[len(xml_model_prefix):]
+                CpVersions = list(CpVersions_initial)
+                printStr(f"Force-model: retrying with {FORCE_MODEL} ({len(remain_list)} hash(es) remaining)")
+                result = _run_brute(fm_FirstCode, fm_ThirdCode, fm_SecondCode, model, cc, remain_md5, remain_hmac, combos, CpVersions, oldJson, remain_list, label=f"force-{FORCE_MODEL}")
+                DecDicts.update(result)
+            else:
+                printStr(f"Force-model: all hashes decrypted on first try, skipping {FORCE_MODEL} retry")
 
-                                if CpVersions:
-                                    for tempCpVersion in tempCP:
-                                        version2 = FirstCode + i1 + randomVersion + "/" + SecondCode + randomVersion + "/" + tempCpVersion
-                                        if version1 == version2:
-                                            continue
-                                        if (
-                                            model in oldJson
-                                            and cc in oldJson[model]
-                                            and "versions" in oldJson[model][cc]
-                                            and version2 in oldJson[model][cc]["versions"].values()
-                                        ):
-                                            continue
-                                        md5 = hashlib.md5()
-                                        md5.update(version2.encode())
-                                        if md5.hexdigest() in md5list:
-                                            DecDicts[md5.hexdigest()] = version2
-                                            printStr(f"<Baseband> Added <{model} {getCountryName(cc)}> test firmware: {version2}")
-                                            if version2.split("/")[2] and version2.split("/")[2] not in CpVersions and version2.split("/")[2] not in tempCP:
-                                                CpVersions.append(version2.split("/")[2])
-                                                tempCP.append(version2.split("/")[2])
-
-                                vc2 = bl_version + "Z" + yearStr + monthStr + serialStr
-                                tempCode = "" if not ThirdCode else ThirdCode + i1 + randomVersion
-                                version3 = FirstCode + i1 + vc2 + "/" + SecondCode + vc2 + "/" + tempCode
-                                if (
-                                    model in oldJson
-                                    and cc in oldJson[model]
-                                    and "versions" in oldJson[model][cc]
-                                    and version3 in oldJson[model][cc]["versions"].values()
-                                ):
-                                    continue
-                                md5 = hashlib.md5()
-                                md5.update(version3.encode())
-                                if md5.hexdigest() in md5list:
-                                    DecDicts[md5.hexdigest()] = version3
-                                    if version3.split("/")[2] and version3.split("/")[2] not in CpVersions and version3.split("/")[2] not in tempCP:
-                                        CpVersions.append(version3.split("/")[2])
-                                        tempCP.append(version3.split("/")[2])
-
-                                if CpVersions:
-                                    for tempCpVersion in tempCP:
-                                        version4 = FirstCode + i1 + vc2 + "/" + SecondCode + vc2 + "/" + tempCpVersion
-                                        if version1 == version4:
-                                            continue
-                                        if (
-                                            model in oldJson
-                                            and cc in oldJson[model]
-                                            and "versions" in oldJson[model][cc]
-                                            and version4 in oldJson[model][cc]["versions"].values()
-                                        ):
-                                            continue
-                                        md5 = hashlib.md5()
-                                        md5.update(version4.encode())
-                                        if md5.hexdigest() in md5list:
-                                            DecDicts[md5.hexdigest()] = version4
-                                            printStr(f"<Z> Added <{model} {getCountryName(cc)}> test firmware: {version4}")
-                                            if version4.split("/")[2] and version4.split("/")[2] not in CpVersions and version4.split("/")[2] not in tempCP:
-                                                CpVersions.append(version4.split("/")[2])
-                                                tempCP.append(version4.split("/")[2])
+        if BRUTEFORCE:
+            matched = set(DecDicts.keys())
+            remain_md5 = md5set - matched
+            remain_hmac = hmacset - matched
+            if remain_md5 or remain_hmac:
+                remain_list = list(remain_md5 | remain_hmac)
+                ap_range = _str_range(FORCE_AP_START, FORCE_AP_END)
+                modem_range = _str_range(FORCE_MODEM_START, FORCE_MODEM_END)
+                model_prefix = model.replace("SM-", "")
+                for ap in ap_range:
+                    for modem in modem_range:
+                        bf_FirstCode = model_prefix + ap
+                        bf_ThirdCode = model_prefix + modem
+                        CpVersions = list(CpVersions_initial)
+                        printStr(f"Brute-force: AP={ap}, Modem={modem} ({len(remain_list)} hash(es) remaining)")
+                        result = _run_brute(bf_FirstCode, bf_ThirdCode, SecondCode, model, cc, remain_md5, remain_hmac, combos, CpVersions, oldJson, remain_list, label=f"{ap}/{modem}")
+                        DecDicts.update(result)
+                        remain_md5 -= set(result.keys())
+                        remain_hmac -= set(result.keys())
+                        remain_list = list(remain_md5 | remain_hmac)
+                        if not remain_list:
+                            break
+                    if not remain_list:
+                        break
+                if remain_list:
+                    printStr(f"Brute-force: {len(remain_list)} hash(es) still undecrypted after all AP/modem combinations")
+            else:
+                printStr("Brute-force: all hashes decrypted on first try, skipping AP/modem range scan")
 
         oldDicts[model][cc].update(DecDicts)
         key_func = make_sort_key(oldDicts[model][cc].values())
@@ -682,7 +818,7 @@ def getLatestVersion(version_list, chars):
 def run():
     # Get related parameter variable data
     global args
-    global modelDic, oldMD5Dict, isFirst
+    global modelDic, oldMD5Dict
     jsonStr = ""
     decDicts = {"last_update_time": getNowTime()}
     if args.output:
@@ -701,8 +837,7 @@ def run():
         oldJson = {}
         if jsonStr != "":
             oldJson = json.loads(jsonStr)
-        hasNewVersion = False
-        with ProcessPoolExecutor(max_workers=4) as pool:
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
             future_to_model = {
                 pool.submit(getNewVersions, oldJson, model, modelDic, oldMD5Dict): model
                 for model in modelDic
@@ -711,15 +846,13 @@ def run():
                 model = future_to_model[future]
                 result = future.result()
                 if result is not None:
-                    hasNew, newMDic = result
-                    if hasNew:
-                        hasNewVersion = True
+                    _, newMDic = result
                     for m, cc_dict in newMDic.items():
                         if m not in decDicts:
                             decDicts[m] = {}
                         for cc, cc_data in cc_dict.items():
                             decDicts[m][cc] = cc_data
-                f.write(textStr)
+
     endTime = time.perf_counter()
     printStr(f"Total time: {round(endTime - startTime, 2)}s")
     # Create deep copy to avoid destroying original data
@@ -784,16 +917,7 @@ def process_cc(cc, modelDic, oldMD5Dict, md5Dic, oldJson, model):
             "decryption_count": 0,
         }
     if model in oldMD5Dict and cc in oldMD5Dict[model]:
-        # Get add/remove information of MD5 encoded firmware version numbers
         newMD5Dict[model][cc] = deepcopy(oldMD5Dict[model][cc])
-        oldMD5Vers = oldMD5Dict[model][cc]["versions"]
-        newMD5Vers = md5Dic[cc]
-        addAndRemoveInfo = getFirmwareAddAndRemoveInfo(
-            oldJson=oldMD5Vers, newJson=newMD5Vers
-        )
-        WriteInfo(
-            model=model, cc=cc, AddAndRemoveInfo=addAndRemoveInfo, modelDic=modelDic
-        )
     else:
         # Initialize content for new device
         newMD5Dict[model][cc] = {"versions": {}, "firmware_count": 0}
@@ -872,7 +996,7 @@ def getNewVersions(oldJson, model, modelDic, oldMD5Dict):
     newMDic = {model: {}}
     md5Dicts_list = []  # Used to collect newMD5Dict from each thread
     hasNewVersion = False
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ProcessPoolExecutor(max_workers=num_workers) as pool:
         future_to_cc = {
             pool.submit(
                 process_cc, cc, modelDic, oldMD5Dict, md5Dic, oldJson, model
@@ -902,11 +1026,6 @@ def getNewVersions(oldJson, model, modelDic, oldMD5Dict):
     return hasNewVersion, newMDic
 
 
-def init_globals(q):
-    global log_queue
-    log_queue = q
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Decrypt Samsung firmware test versions.')
     parser.add_argument('--ap', help='Force AP prefix (e.g., UB)')
@@ -921,39 +1040,60 @@ if __name__ == "__main__":
     parser.add_argument('--output', help='Base name for output files (without extension)')
     parser.add_argument('--model', help='Model name (e.g., SM-A156M)')
     parser.add_argument('--csc', help='Country Service Code (e.g, ZTO)')
+    parser.add_argument('--workers', type=int, default=os.cpu_count(), help='Number of parallel workers (default: CPU count)')
+    parser.add_argument('--bruteforce', action='store_true', help='Enable AP/modem range brute-force')
+    parser.add_argument('--ap-start', help='AP range start (e.g., AA)')
+    parser.add_argument('--ap-end', help='AP range end (e.g., AZ)')
+    parser.add_argument('--modem-start', help='Modem range start (e.g., AA)')
+    parser.add_argument('--modem-end', help='Modem range end (e.g., AZ)')
+    parser.add_argument('--force-model', help='Override model for version string construction (e.g., SM-A185F)')
     args = parser.parse_args()
     
-    if not args.model and not args.csc:
-        if args.ap:
-            FORCE_AP = args.ap
-        if args.csc:
-            FORCE_CSC = args.cscp
-        if args.modem:
-            FORCE_MODEM = args.modem
-        if args.bls:
-            FORCE_STARTBL = args.bls
-        if args.ble:
-            FORCE_ENDBL = args.ble
-        if args.sup:
-            FORCE_SUP = args.sup
-        if args.eup:
-            FORCE_EUP = args.eup        # Major version from A to Z
-        if args.sy:
-            FORCE_SY = args.sy
-        if args.ey:
-            FORCE_EY = args.ey  
+    if args.ap:
+        FORCE_AP = args.ap
+    if args.cscp:
+        FORCE_CSC = args.cscp
+    if args.modem:
+        FORCE_MODEM = args.modem
+    if args.bls:
+        FORCE_STARTBL = args.bls
+    if args.ble:
+        FORCE_ENDBL = args.ble
+    if args.sup:
+        FORCE_SUP = args.sup
+    if args.eup:
+        FORCE_EUP = args.eup        # Major version from A to Z
+    if args.sy:
+        FORCE_SY = args.sy
+    if args.ey:
+        FORCE_EY = args.ey
+    if args.workers:
+        num_workers = args.workers
+    if args.bruteforce:
+        BRUTEFORCE = True
+        if args.ap_start:
+            FORCE_AP_START = args.ap_start
+        if args.ap_end:
+            FORCE_AP_END = args.ap_end
+        if args.modem_start:
+            FORCE_MODEM_START = args.modem_start
+        if args.modem_end:
+            FORCE_MODEM_END = args.modem_end
+    if args.force_model:
+        FORCE_MODEL = args.force_model
 
     if args.model and args.csc is None:
         sys.exit("Error: Critical parameters missing.")
 
+    if BRUTEFORCE and (not FORCE_AP_START or not FORCE_AP_END or not FORCE_MODEM_START or not FORCE_MODEM_END):
+        sys.exit("Error: --bruteforce requires --ap-start, --ap-end, --modem-start, --modem-end.")
+
     try:
         oldMD5Dict = LoadOldMD5Firmware()  # Get last MD5 encoded version number data
         try:
-            modelDic = getModel()  # Get model information from database
-        except Exception as db_error:
+            modelDic = getModel()  # Get model information from arguments
+        except Exception:
             sys.exit("Error: Something went wrong.")
         run()
-    except func_timeout.exceptions.FunctionTimedOut:
-        printStr("Task timeout, execution exited!")
     except Exception as e:
         printStr(f"Error occurred: {e}")
