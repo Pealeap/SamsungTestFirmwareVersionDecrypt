@@ -1,4 +1,9 @@
 # Samsung Test Firmware Version Decryption Tool
+
+## Added HMAC-SHA256 support
+
+#### ye ik run.sh is terrible but who cares
+
 ## To run:
 
 ### Normal mode:

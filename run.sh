@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh
+# run.sh sam firm decrypt
 
 if [[ ! -d "./venv" ]]; then
 	python -m venv venv
